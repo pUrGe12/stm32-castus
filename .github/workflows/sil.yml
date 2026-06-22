@@ -25,26 +25,21 @@ jobs:
         run: make test-host
 
   sil-verify:
-    name: SIL verification (Cortex-M4 emulation)
+    name: SIL verification (Cortex-M4)
     runs-on: ubuntu-latest
     needs: lint-and-test
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ARM toolchain
+      - name: Set up environment
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-arm-none-eabi libnewlib-arm-none-eabi
-
-      - name: Install Renode
-        run: |
-          wget -q https://builds.renode.io/renode-latest.linux-portable.tar.gz -O /tmp/renode.tar.gz
+          wget -q https://builds.renode.io/renode-latest.linux-portable.tar.gz -O /tmp/emu.tar.gz
           mkdir -p /opt/renode
-          tar xzf /tmp/renode.tar.gz -C /opt/renode --strip-components=1
+          tar xzf /tmp/emu.tar.gz -C /opt/renode --strip-components=1
           echo "/opt/renode" >> $GITHUB_PATH
-
-      - name: Install Python deps
-        run: pip install pyyaml
+          pip install pyyaml
 
       - name: Build firmware
         run: make build
