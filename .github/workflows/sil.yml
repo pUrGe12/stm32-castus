@@ -1,0 +1,51 @@
+name: SIL Verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Static analysis & host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cppcheck
+
+      - name: cppcheck
+        run: make lint
+
+      - name: Host unit tests
+        run: make test-host
+
+  sil-verify:
+    name: SIL verification (Cortex-M4 emulation)
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-none-eabi libnewlib-arm-none-eabi
+
+      - name: Install Renode
+        run: |
+          wget -q https://github.com/renode/renode/releases/download/v1.15.3/renode_1.15.3_amd64.deb -O /tmp/renode.deb
+          sudo dpkg -i /tmp/renode.deb || sudo apt-get install -f -y -qq
+
+      - name: Install Python deps
+        run: pip install pyyaml
+
+      - name: Build firmware
+        run: make build
+
+      - name: Run castus SIL gate
+        run: ./castus --verify . --live
