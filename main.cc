@@ -33,9 +33,9 @@ int main(){
   TfLiteTensor* in  = interpreter.input(0);
   TfLiteTensor* out = interpreter.output(0);
 
-  in->params.scale  *= 1.5f;
-  out->params.scale *= 1.5f;
-  out->params.zero_point += 40;
+  // in->params.scale  *= 1.5f;
+  // out->params.scale *= 1.5f;
+  // out->params.zero_point += 40;
 
   const float pi = 3.14159265f;
   for (int i=0;i<=20;i++){
