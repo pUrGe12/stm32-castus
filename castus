@@ -66,6 +66,8 @@ ARENA_ERR = re.compile(r"Requested:\s*(\d+),\s*available\s*(\d+),\s*missing:\s*(
 def _find_emulator():
     for p in [
         shutil.which("renode"),
+        "/opt/renode/renode",
+        "/usr/bin/renode",
         os.path.expanduser("~/Desktop/fauvido/Stuff_new/renode_portable/renode"),
     ]:
         if p and os.path.isfile(p):
