@@ -9,7 +9,7 @@ extern const unsigned char model_tflite[];
 extern const unsigned int  model_tflite_len;
 
 namespace {
-constexpr int kArenaSize = 2048;
+constexpr int kArenaSize = 2048; // Reducing Arena Size
 alignas(16) uint8_t arena[kArenaSize];
 }
 
@@ -32,6 +32,10 @@ int main(){
 
   TfLiteTensor* in  = interpreter.input(0);
   TfLiteTensor* out = interpreter.output(0);
+
+  in->params.scale  *= 1.5f;
+  out->params.scale *= 1.5f;
+  out->params.zero_point += 40;
 
   const float pi = 3.14159265f;
   for (int i=0;i<=20;i++){
