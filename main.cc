@@ -9,19 +9,19 @@ extern const unsigned char model_tflite[];
 extern const unsigned int  model_tflite_len;
 
 namespace {
-constexpr int kArenaSize = 2048;          // <-- EXPERIMENT A: set 200 to kill the boot
+constexpr int kArenaSize = 2048;
 alignas(16) uint8_t arena[kArenaSize];
 }
 
 int main(){
   uart_init();
-  RegisterDebugLogCallback(uart_write);    // <-- without this, total silence
+  RegisterDebugLogCallback(uart_write);
 
   const tflite::Model* model = tflite::GetModel(model_tflite);
   if (model->version() != TFLITE_SCHEMA_VERSION){ MicroPrintf("schema mismatch"); for(;;); }
 
   tflite::MicroMutableOpResolver<1> resolver;
-  resolver.AddFullyConnected();            // match hello_world_test.cc if Invoke complains
+  resolver.AddFullyConnected();
 
   tflite::MicroInterpreter interpreter(model, resolver, arena, kArenaSize);
   if (interpreter.AllocateTensors() != kTfLiteOk){
@@ -32,11 +32,6 @@ int main(){
 
   TfLiteTensor* in  = interpreter.input(0);
   TfLiteTensor* out = interpreter.output(0);
-
-  // <-- EXPERIMENT B: uncomment to corrupt quant scaling and watch it drift
-  // in->params.scale  *= 1.5f;
-  // out->params.scale *= 1.5f;
-  // out->params.zero_point += 40;
 
   const float pi = 3.14159265f;
   for (int i=0;i<=20;i++){
