@@ -1,0 +1,3 @@
+Failed to resize buffer. Requested: 144, available 76, missing: 68
+Failed starting model allocation.
+AllocateTensors FAILED (arena too small) -- boot aborted

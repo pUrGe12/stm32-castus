@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""castus — SIL verification gate for edge-ML firmware."""
+import os
+import re
+import sys
+import time
+import shutil
+import tempfile
+import argparse
+import subprocess
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("castus: needs pyyaml  ->  pip install pyyaml")
+
+# ── ANSI ─────────────────────────────────────────────────────────────────────
+def _c(code):
+    return "" if os.environ.get("NO_COLOR") else code
+
+G, R, Y, B, DIM, BOLD, X = (
+    _c("\033[32m"), _c("\033[31m"), _c("\033[33m"), _c("\033[34m"),
+    _c("\033[2m"), _c("\033[1m"), _c("\033[0m"),
+)
+CYAN   = _c("\033[36m")
+MAGENTA = _c("\033[35m")
+BG_RED   = _c("\033[41;97m")
+BG_GREEN = _c("\033[42;97m")
+
+ok      = lambda s: f"{G}{s}{X}"
+err     = lambda s: f"{R}{s}{X}"
+bold    = lambda s: f"{BOLD}{s}{X}"
+dim     = lambda s: f"{DIM}{s}{X}"
+heading = lambda s: f"{BOLD}{CYAN}{s}{X}"
+
+BOX_TL, BOX_TR, BOX_BL, BOX_BR = "╭", "╮", "╰", "╯"
+BOX_H, BOX_V = "─", "│"
+
+def box(title, lines, color=CYAN):
+    w = max(len(_strip_ansi(l)) for l in lines) if lines else 40
+    w = max(w, len(title) + 4, 52)
+    print(f"  {color}{BOX_TL}{BOX_H} {X}{bold(title)} {color}{BOX_H * (w - len(title) - 3)}{BOX_TR}{X}")
+    for l in lines:
+        pad = w - len(_strip_ansi(l))
+        print(f"  {color}{BOX_V}{X} {l}{' ' * pad}{color}{BOX_V}{X}")
+    print(f"  {color}{BOX_BL}{BOX_H * (w + 1)}{BOX_BR}{X}")
+
+def _strip_ansi(s):
+    return re.sub(r'\033\[[0-9;]*m', '', s)
+
+def bar(label, value, total, width=30, fill_color=G):
+    filled = int(value / total * width) if total else 0
+    bar_str = f"{fill_color}{'█' * filled}{DIM}{'░' * (width - filled)}{X}"
+    return f"{label}  {bar_str}  {value}/{total}"
+
+
+# ── regexes ──────────────────────────────────────────────────────────────────
+BOOT_OK   = re.compile(r"boot ok,\s*arena_used=(\d+)")
+BOOT_FAIL = re.compile(r"AllocateTensors FAILED|Failed to resize buffer|Failed starting model")
+SAMPLE    = re.compile(r"x_milli=(-?\d+)\s+y_milli=(-?\d+)")
+ARENA_ERR = re.compile(r"Requested:\s*(\d+),\s*available\s*(\d+),\s*missing:\s*(\d+)")
+
+
+# ── emulator interface (hidden from user) ────────────────────────────────────
+
+def _find_emulator():
+    for p in [
+        shutil.which("renode"),
+        os.path.expanduser("~/Desktop/fauvido/Stuff_new/renode_portable/renode"),
+    ]:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+def _run_emulator(elf_path, resc_template, timeout=30):
+    emu = _find_emulator()
+    if not emu:
+        sys.exit("castus: emulator not found")
+
+    with tempfile.NamedTemporaryFile("w", suffix=".resc", delete=False) as f:
+        f.write(resc_template.replace("$ELF", elf_path))
+        resc = f.name
+
+    cmd = [emu, "--disable-gui", "--console", resc]
+    uart_lines = []
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.monotonic() + timeout
+        for raw in p.stdout:
+            m = re.search(r'usart\d+:.*?\]\s*(.*)', raw)
+            if m:
+                uart_lines.append(m.group(1))
+            if "boot aborted" in raw or "boot_aborted" in raw:
+                break
+            if SAMPLE.search(raw) and len([l for l in uart_lines if SAMPLE.search(l)]) >= 21:
+                break
+            if time.monotonic() > deadline:
+                break
+    finally:
+        p.terminate()
+        p.wait()
+        os.unlink(resc)
+
+    return "\n".join(uart_lines)
+
+
+RESC_STM32 = """:name: sil-verify
+using sysbus
+mach create "mcu"
+machine LoadPlatformDescription @platforms/boards/stm32f4_discovery.repl
+sysbus LoadELF @$ELF
+showAnalyzer sysbus.usart2
+start
+"""
+
+def capture(cfg, live, timeout=30):
+    replay = cfg.get("boot", {}).get("replay")
+    if not live and replay:
+        with open(replay) as f:
+            return f.read()
+    return _run_emulator(
+        os.path.abspath(cfg["build"]["elf"]),
+        RESC_STM32,
+        timeout=timeout,
+    )
+
+
+# ── checks ───────────────────────────────────────────────────────────────────
+
+def check_boot(cfg, log):
+    arena_cfg = cfg.get("arena", {})
+    arena_total = arena_cfg.get("size", "?")
+
+    m_ok = BOOT_OK.search(log)
+    m_fail = BOOT_FAIL.search(log)
+    m_arena = ARENA_ERR.search(log)
+
+    lines = []
+    if m_ok:
+        used = int(m_ok.group(1))
+        lines.append(f"  status      {ok('BOOT OK')}")
+        lines.append(f"  arena total {bold(str(arena_total))} bytes")
+        lines.append(f"  arena used  {bold(str(used))} bytes")
+        if isinstance(arena_total, int):
+            pct = used * 100 // arena_total
+            lines.append(f"  utilization {bar(f'{pct}%', used, arena_total)}")
+        lines.append(f"  model       {dim(cfg.get('model', 'tflite-micro sine'))}")
+        lines.append(f"  target      {dim(cfg.get('target', 'Cortex-M4F'))}")
+    elif m_fail:
+        lines.append(f"  status      {err('BOOT FAILED')}")
+        if m_arena:
+            req, avail, missing = m_arena.groups()
+            lines.append(f"  requested   {bold(req)} bytes")
+            lines.append(f"  available   {err(avail)} bytes")
+            lines.append(f"  deficit     {err(missing)} bytes")
+        lines.append(f"  arena total {bold(str(arena_total))} bytes")
+        lines.append(f"  cause       {err('tensor arena too small — allocation failed')}")
+        lines.append(f"  model       {dim(cfg.get('model', 'tflite-micro sine'))}")
+        lines.append(f"  target      {dim(cfg.get('target', 'Cortex-M4F'))}")
+    else:
+        lines.append(f"  status      {err('UNKNOWN (no boot message)')}")
+
+    print()
+    box("BOOT CHECK", lines)
+
+    if m_fail:
+        print()
+        print(f"  {R}  ✗ firmware failed to boot — tensor arena undersized{X}")
+        print(f"  {DIM}    The model requires more memory than the configured arena.{X}")
+        print(f"  {DIM}    Increase kArenaSize in main.cc and rebuild.{X}")
+        return False
+
+    if m_ok:
+        print(f"  {G}  ✓ firmware booted successfully{X}")
+        return True
+
+    print(f"  {R}  ✗ could not determine boot status{X}")
+    return False
+
+
+def check_inference(cfg, log, opts):
+    golden = opts["golden"]
+    tol = opts.get("tol", 0.05)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+        f.write(log)
+        test_path = f.name
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    compare = os.path.join(here, "checks", "compare.py")
+    r = subprocess.run([sys.executable, compare, golden, test_path],
+                       capture_output=True, text=True)
+    os.unlink(test_path)
+
+    # parse compare output
+    out = (r.stdout or r.stderr).strip()
+    lines_raw = out.splitlines()
+
+    n_compared = 0
+    max_delta = 0.0
+    max_delta_x = 0.0
+    first_div = None
+    bad_count = 0
+    total_count = 0
+
+    for line in lines_raw:
+        m = re.match(r'compared (\d+) samples', line)
+        if m:
+            n_compared = int(m.group(1))
+            total_count = n_compared
+        m = re.match(r'max \|Δy\| = ([\d.]+) at x=([\d.]+)', line)
+        if m:
+            max_delta = float(m.group(1))
+            max_delta_x = float(m.group(2))
+        m = re.match(r'first divergence at x=([\d.]+): golden y=([\d.]+)\s+actual y=([\d.]+)\s+Δ=([\d.]+)', line)
+        if m:
+            first_div = (float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4)))
+        m = re.match(r'(\d+)/(\d+) samples beyond', line)
+        if m:
+            bad_count = int(m.group(1))
+            total_count = int(m.group(2))
+
+    passed = r.returncode == 0
+
+    # build display
+    lines = []
+    lines.append(f"  golden ref  {dim(golden)}")
+    lines.append(f"  tolerance   {dim(str(tol))}")
+    lines.append(f"  samples     {bold(str(n_compared))}")
+    lines.append(f"  max |Δy|    {(err if max_delta > tol else ok)(f'{max_delta:.4f}')} at x={max_delta_x:.3f}")
+
+    if first_div:
+        x, gy, ay, d = first_div
+        lines.append(f"  first drift {err(f'x={x:.3f}  expected={gy:.3f}  got={ay:.3f}  Δ={d:.4f}')}")
+
+    if total_count:
+        good = total_count - bad_count
+        lines.append(f"  pass/fail   {bar('', good, total_count, fill_color=G if passed else R)}")
+
+    print()
+    box("INFERENCE CHECK", lines)
+
+    if passed:
+        print(f"  {G}  ✓ all samples within tolerance{X}")
+    else:
+        print(f"  {R}  ✗ {bad_count}/{total_count} samples beyond tolerance (Δ > {tol}){X}")
+        if max_delta > 0.2:
+            print(f"  {DIM}    Likely cause: quantization parameter corruption or scaling error.{X}")
+            print(f"  {DIM}    Check input/output scale and zero_point in the firmware.{X}")
+
+    return passed
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def banner(cfg, mode):
+    w = 54
+    print()
+    print(f"  {CYAN}{BOX_TL}{BOX_H * w}{BOX_TR}{X}")
+    title = "castus"
+    ver = "0.2"
+    pad = w - len(title) - len(ver) - 5
+    print(f"  {CYAN}{BOX_V}{X}  {BOLD}{Y}{title}{X} {DIM}v{ver}{X}{' ' * pad}{CYAN}{BOX_V}{X}")
+    print(f"  {CYAN}{BOX_V}{X}  {DIM}software-in-the-loop verification gate{X}          {CYAN}{BOX_V}{X}")
+    print(f"  {CYAN}{BOX_V}{X}{' ' * w}{CYAN}{BOX_V}{X}")
+    print(f"  {CYAN}{BOX_V}{X}  project   {bold(cfg['project'])}{' ' * (w - 12 - len(cfg['project']))}{CYAN}{BOX_V}{X}")
+    target = cfg.get('target', 'Cortex-M4F')
+    print(f"  {CYAN}{BOX_V}{X}  target    {bold(target)}{' ' * (w - 12 - len(target))}{CYAN}{BOX_V}{X}")
+    model = cfg.get('model', 'tflite-micro sine')
+    print(f"  {CYAN}{BOX_V}{X}  model     {dim(model)}{' ' * (w - 12 - len(model))}{CYAN}{BOX_V}{X}")
+    print(f"  {CYAN}{BOX_V}{X}  mode      {dim(mode)}{' ' * (w - 12 - len(mode))}{CYAN}{BOX_V}{X}")
+    print(f"  {CYAN}{BOX_BL}{BOX_H * w}{BOX_BR}{X}")
+    print()
+
+
+def verdict(passed):
+    print()
+    if passed:
+        print(f"  {BG_GREEN}                                                        {X}")
+        print(f"  {BG_GREEN}    VERDICT:  PASS ✓    firmware verified                {X}")
+        print(f"  {BG_GREEN}                                                        {X}")
+    else:
+        print(f"  {BG_RED}                                                        {X}")
+        print(f"  {BG_RED}    VERDICT:  FAIL ✗    firmware rejected                {X}")
+        print(f"  {BG_RED}                                                        {X}")
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="castus",
+        description="SIL verification gate for edge-ML firmware",
+    )
+    ap.add_argument("--verify", metavar="PATH", help="project dir with .castus.yaml")
+    ap.add_argument("--live", action="store_true", help="boot the target emulation instead of replaying a captured log")
+    a = ap.parse_args()
+
+    if not a.verify:
+        ap.error("nothing to do — try:  castus --verify .")
+
+    os.chdir(a.verify)
+
+    for name in (".castus.yaml", ".castus-config.yaml"):
+        if os.path.exists(name):
+            cfg = yaml.safe_load(open(name))
+            break
+    else:
+        sys.exit(f"castus: no .castus.yaml found in {os.path.abspath('.')}")
+
+    mode = "live" if a.live else "replay"
+    banner(cfg, mode)
+
+    # check artifact exists
+    replaying = (not a.live) and cfg.get("boot", {}).get("replay")
+    artifact = cfg["boot"]["replay"] if replaying else cfg["build"]["elf"]
+    if not os.path.exists(artifact):
+        print(f"  {R}✗ artifact not found: {artifact}{X}")
+        sys.exit(1)
+    print(f"  {DIM}▸ loading firmware artifact ...{X}")
+
+    log = capture(cfg, a.live, timeout=cfg.get("boot", {}).get("timeout", 30))
+
+    passed = True
+    for spec in cfg["checks"]:
+        name = spec if isinstance(spec, str) else next(iter(spec))
+        opts = {} if isinstance(spec, str) else spec[name]
+
+        if name == "boot":
+            passed &= check_boot(cfg, log)
+        elif name == "inference":
+            if not passed:
+                print()
+                box("INFERENCE CHECK", [f"  {DIM}skipped — boot failed{X}"])
+                continue
+            passed &= check_inference(cfg, log, opts)
+
+    verdict(passed)
+    sys.exit(0 if passed else 1)
+
+
+if __name__ == "__main__":
+    main()

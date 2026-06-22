@@ -1,0 +1,19 @@
+project: sine-tracker
+target:  Cortex-M4F
+model:   tflite-micro hello_world (int8 quantized)
+
+build:
+  elf: hello_world.elf
+
+arena:
+  size: 2048
+
+boot:
+  replay: build/boot.log
+  timeout: 30
+
+checks:
+  - boot
+  - inference:
+      golden: golden/sine.log
+      tol: 0.05
